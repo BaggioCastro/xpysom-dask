@@ -11,11 +11,27 @@ import os
 
 import numpy as np
 try:
+    # Cupy needs to be imported first.
+    # Cudf is crashing containers if it goes first.
     import cupy as cp
+    import cudf
+    import dask_cudf as dcudf
     default_xp = cp
+    GPU_SUPPORTED=True
 except:
     print("WARNING: CuPy could not be imported")
     default_xp = np
+    GPU_SUPPORTED=False
+
+try:
+    import dask
+    import dask.array as da
+    import dask.delayed as dd
+    import dask.dataframe as ddf
+    default_da = True
+except:
+    print("WARNING: Dask Arrays could not be imported")
+    default_da = False
 
 from .distances import cosine_distance, manhattan_distance, euclidean_squared_distance, euclidean_squared_distance_part, euclidean_distance
 from .neighborhoods import gaussian_generic, gaussian_rect, mexican_hat_generic, mexican_hat_rect, bubble, triangle, prepare_neig_func
@@ -61,7 +77,8 @@ class XPySom:
                  topology='rectangular', 
                  activation_distance='euclidean', 
                  random_seed=None, n_parallel=0, compact_support=False,
-                 xp=default_xp):
+                 xp=default_xp,
+                 use_dask=False, dask_chunks='auto'):
         """Initializes a Self Organizing Maps.
 
         A rule of thumb to set the size of the grid for a dimensionality
@@ -130,6 +147,12 @@ class XPySom:
         compact_support: bool, optional (default=False)
             Cut the neighbor function to 0 beyond neighbor radius sigma
 
+        use_dask: bool, optional (default=False)
+            Use a distributed SOM based on Dask clustering
+
+        dask_chunks: tuple, optional (default='auto')
+            The size of the data chunks that it will be splited up
+
         """
 
         if sigma >= x or sigma >= y:
@@ -139,9 +162,13 @@ class XPySom:
 
         self.xp = xp
 
+        # Use dask for clustering SOM
+        self.use_dask = use_dask & default_da
+        self.dask_chunks = dask_chunks
+
         self._learning_rate = learning_rate
         self._learning_rateN = learning_rateN
-        
+
         if sigma == 0:
             self._sigma = min(x,y)/2
         else:
@@ -216,11 +243,6 @@ class XPySom:
 
         self._unravel_precomputed = self.xp.unravel_index(self.xp.arange(x*y, dtype=self.xp.int64), (x,y))
 
-        # this will be used to point to device memory
-        # NB: if xp is numpy, then it will just be a pointer to _weights
-        self._weights_gpu = None
-        self._sq_weights_gpu = None
-
         if n_parallel == 0:
             if self.xp.__name__ == 'cupy':
                 n_parallel = find_max_cuda_threads()
@@ -229,8 +251,10 @@ class XPySom:
  
             if n_parallel == 0:
                 raise ValueError("n_parallel was not specified and could not be infered from system")
-        
+
         self._n_parallel = n_parallel
+
+        self._sq_weights_gpu = None
 
     
     def get_neig_functions(self):
@@ -260,7 +284,7 @@ class XPySom:
             }
         else:
             neig_functions = {}
-        
+
         return neig_functions
 
 
@@ -277,11 +301,13 @@ class XPySom:
 
         Only useful if the topology chosen is not rectangular.
         """
-        if self.xp.__name__ == 'cupy':
-            # I need to transfer them to host
-            return self._xx.self.xp.asnumpy(T), self._yy.self.xp.asnumpy(T)
-        else:
-            return self._xx.T, self._yy.T
+        if GPU_SUPPORTED:
+            if isinstance(self._xx.T, cp.ndarray) and \
+               isinstance(self._yy.T, cp.ndarray):
+                # I need to transfer them to host
+                return self._xx.T.get(), self._yy.T.get()
+
+        return self._xx.T, self._yy.T
 
 
     def convert_map_to_euclidean(self, xy):
@@ -290,29 +316,29 @@ class XPySom:
 
         Only useful if the topology chosen is not rectangular.
         """
-        if self.xp.__name__ == 'cupy':
-            # I need to transfer them to host
-            return self._xx.self.xp.asnumpy(T)[xy], self._yy.self.xp.asnumpy(T)[xy]
-        else:
-            return self._xx.T[xy], self._yy.T[xy]
+        if GPU_SUPPORTED:
+            if isinstance(self._xx.T, cp.ndarray) and \
+               isinstance(self._yy.T, cp.ndarray):
+                # I need to transfer them to host
+                return self._xx.T.get()[xy], self._yy.T.get()[xy]
+
+        return self._xx.T[xy], self._yy.T[xy]
 
 
     def activate(self, x):
         """Returns the activation map to x."""
         x_gpu = self.xp.array(x)
-        self._weights_gpu = self.xp.array(self._weights)
+        weights_gpu = self.xp.array(self._weights)
 
-        self._activate(x_gpu)
+        self._activate(x_gpu, weights_gpu)
 
-        self._weights_gpu = None
-
-        if self.xp.__name__ == 'cupy':
-            return self.xp.asnumpy(self._activation_map_gpu)
+        if GPU_SUPPORTED and isinstance(self._activation_map_gpu, cp.ndarray):
+            return self._activation_map_gpu.get()
         else:
             return self._activation_map_gpu
 
 
-    def _activate(self, x_gpu):
+    def _activate(self, x_gpu, weights_gpu):
         """Updates matrix activation_map, in this matrix
            the element i,j is the response of the neuron i,j to x"""
         if len(x_gpu.shape) == 1:
@@ -321,14 +347,14 @@ class XPySom:
         if self._sq_weights_gpu is not None:
             self._activation_map_gpu = self._activation_distance(
                     x_gpu, 
-                    self._weights_gpu,
+                    weights_gpu,
                     self._sq_weights_gpu,
                     xp=self.xp
             )
         else:
             self._activation_map_gpu = self._activation_distance(
                     x_gpu, 
-                    self._weights_gpu,
+                    weights_gpu,
                     xp=self.xp
             )
 
@@ -351,12 +377,19 @@ class XPySom:
         """Computes the coordinates of the winning neurons for the samples x.
         """
 
-        x_gpu = self.xp.array(x)
-        self._weights_gpu = self.xp.array(self._weights)
+        if self.use_dask:
+            x_gpu = da.from_array(self.xp.array(x))
+        else:
+            x_gpu = self.xp.array(x)
+
+        weights_gpu = self.xp.array(self._weights)
 
         orig_shape = x_gpu.shape
         if len(orig_shape) == 1:
-            x_gpu = self.xp.expand_dims(x_gpu, axis=0)
+            if isinstance(x_gpu, da.core.Array):
+                x_gpu = da.expand_dims(x_gpu, axis=0).compute()
+            else:
+                x_gpu = self.xp.expand_dims(x_gpu, axis=0)
 
         winners_chunks = []
         for i in range(0, len(x), self._n_parallel):
@@ -365,65 +398,66 @@ class XPySom:
             if end > len(x):
                 end = len(x)
 
-            chunk = self._winner(x_gpu[start:end])
+            chunk = self._winner(x_gpu[start:end], weights_gpu)
             winners_chunks.append(self.xp.vstack(chunk))
 
         winners_gpu = self.xp.hstack(winners_chunks)
 
-        self._weights_gpu = None
-
-        if self.xp.__name__ == 'cupy':
-            winners = self.xp.asnumpy(winners_gpu)
+        if GPU_SUPPORTED and isinstance(winners_gpu, cp.ndarray):
+            winners = winners_gpu.get()
         else:
             winners = winners_gpu
-        
+
         if len(orig_shape) == 1:
             return (winners[0].item(), winners[1].item())
         else:
             return list(map(tuple, winners.T))
 
-    def _winner(self, x_gpu):
+    def _winner(self, x_gpu, winners_gpu):
         """Computes the coordinates of the winning neuron for the sample x"""
         if len(x_gpu.shape) == 1:
             x_gpu = self.xp.expand_dims(x_gpu, axis=0)
 
-        self._activate(x_gpu)
+        self._activate(x_gpu, winners_gpu)
         raveled_idxs = self._activation_map_gpu.argmin(axis=1)
         return (self._unravel_precomputed[0][raveled_idxs], self._unravel_precomputed[1][raveled_idxs])
 
 
-    def _update(self, x_gpu, wins, eta, sig):
+    def _update(self, x_gpu, weights_gpu, eta, sig):
         """Updates the numerator and denominator accumulators.
 
         Parameters
         ----------
         x : np.array
             Current pattern to learn
-        win : tuple
-            Position of the winning neuron for x (array or tuple).
         t : int
             Iteration index
         """
-        
+        weights_gpu = self.xp.asarray(weights_gpu)
+
+        wins = self._winner(x_gpu, weights_gpu)
+
         g_gpu = self.neighborhood(wins, sig, xp=self.xp)*eta
 
         sum_g_gpu = self.xp.sum(g_gpu, axis=0)
         g_flat_gpu = g_gpu.reshape(g_gpu.shape[0], -1)
         gT_dot_x_flat_gpu = self.xp.dot(g_flat_gpu.T, x_gpu)
 
-        self._numerator_gpu += gT_dot_x_flat_gpu.reshape(self._numerator_gpu.shape)
-        self._denominator_gpu += sum_g_gpu[:,:,self.xp.newaxis]
+        _numerator_gpu = gT_dot_x_flat_gpu.reshape(weights_gpu.shape)
+        _denominator_gpu = sum_g_gpu[:,:,self.xp.newaxis]
+
+        return (_numerator_gpu, _denominator_gpu)
 
 
-    def _merge_updates(self):
+    def _merge_updates(self, weights_gpu, numerator_gpu, denominator_gpu):
         """
         Divides the numerator accumulator by the denominator accumulator 
         to compute the new weights. 
         """
-        self._weights_gpu = self.xp.where(
-            self._denominator_gpu != 0,
-            self._numerator_gpu / self._denominator_gpu,
-            self._weights_gpu
+        return self.xp.where(
+            denominator_gpu != 0,
+            numerator_gpu / denominator_gpu,
+            weights_gpu
         )
 
 
@@ -454,23 +488,47 @@ class XPySom:
             iter_end = num_epochs
 
         # Copy arrays to device
-        self._weights_gpu = self.xp.asarray(self._weights, dtype=self.xp.float32)
-        data_gpu = self.xp.asarray(data, dtype=self.xp.float32)
-        
+        weights_gpu = self.xp.asarray(self._weights, dtype=self.xp.float32)
+
+        if GPU_SUPPORTED and isinstance(data, cudf.core.dataframe.DataFrame):
+            data_gpu = data.to_cupy(dtype=self.xp.float32)
+            if self.use_dask:
+                data_gpu_block = da.from_array(data_gpu, chunks=self.dask_chunks)
+        elif GPU_SUPPORTED and isinstance(data, cp._core.core.ndarray):
+            data_gpu = data.astype(self.xp.float32)
+            if self.use_dask:
+                data_gpu_block = da.from_array(data_gpu, chunks=self.dask_chunks)
+        elif default_da and isinstance(data, ddf.core.DataFrame):
+            if self.use_dask:
+                data_gpu_block = data.to_dask_array()
+            else:
+                data_gpu = data.to_dask_array().compute()
+        elif GPU_SUPPORTED and isinstance(data, dcudf.core.DataFrame):
+            if self.use_dask:
+                data_gpu = data.to_dask_array()
+            data_gpu = data.compute()
+        elif default_da and isinstance(data, da.core.Array):
+            if self.use_dask:
+                data_gpu_block = data
+            else:
+                data_gpu = data.compute().astype(self.xp.float32)
+        else:
+            data_gpu = self.xp.asarray(data, dtype=self.xp.float32)
+
         if verbose:
             print_progress(-1, num_epochs*len(data))
 
         for iteration in range(iter_beg, iter_end):
             try: # reuse already allocated memory
-                self._numerator_gpu.fill(0)
-                self._denominator_gpu.fill(0)
-            except AttributeError: # whoops, I haven't allocated it yet
-                self._numerator_gpu = self.xp.zeros(
-                    self._weights_gpu.shape, 
+                numerator_gpu.fill(0)
+                denominator_gpu.fill(0)
+            except UnboundLocalError: # whoops, I haven't allocated it yet
+                numerator_gpu = self.xp.zeros(
+                    weights_gpu.shape,
                     dtype=self.xp.float32
                 )
-                self._denominator_gpu = self.xp.zeros(
-                    (self._weights_gpu.shape[0], self._weights_gpu.shape[1],1),
+                denominator_gpu = self.xp.zeros(
+                    (weights_gpu.shape[0], weights_gpu.shape[1],1),
                     dtype=self.xp.float32
                 )
 
@@ -481,8 +539,8 @@ class XPySom:
             ]:
                 self._sq_weights_gpu = (
                     self.xp.power(
-                        self._weights_gpu.reshape(
-                            -1, self._weights_gpu.shape[2]
+                        weights_gpu.reshape(
+                            -1, weights_gpu.shape[2]
                         ),
                         2
                     ).sum(axis=1, keepdims=True)
@@ -494,36 +552,56 @@ class XPySom:
             # sigma and learning rate decrease with the same rule
             sig = self._decay_function(self._sigma, self._sigmaN, iteration, num_epochs)
 
-            for i in range(0, len(data), self._n_parallel):
-                start = i
-                end = start + self._n_parallel
-                if end > len(data):
-                    end = len(data)
+            if self.use_dask:
+                blocks = data_gpu_block.to_delayed().ravel()
 
-                self._update(data_gpu[start:end], self._winner(data_gpu[start:end]), eta, sig)
+                numerator_gpu_array = []
+                denominator_gpu_array = []
+                for block in blocks:
+                    a, b = dask.delayed(self._update, nout=2)(block, weights_gpu, eta, sig)
+                    numerator_gpu_array.append(a)
+                    denominator_gpu_array.append(b)
 
-                if verbose:
-                    print_progress(
-                        iteration*len(data)+end-1, 
-                        num_epochs*len(data)
-                    )
-                    
-            self._merge_updates()
+                numerator_gpu_sum = dask.delayed(sum)(numerator_gpu_array)
+                denominator_gpu_sum = dask.delayed(sum)(denominator_gpu_array)
+
+                numerator_gpu, denominator_gpu = dask.compute(numerator_gpu_sum, denominator_gpu_sum)
+            else:
+                for i in range(0, len(data), self._n_parallel):
+                    start = i
+                    end = start + self._n_parallel
+                    if end > len(data):
+                        end = len(data)
+
+                    a, b = self._update(data_gpu[start:end], weights_gpu, eta, sig)
+
+                    numerator_gpu += a
+                    denominator_gpu += b
+
+                    if verbose:
+                        print_progress(
+                            iteration*len(data)+end-1,
+                            num_epochs*len(data)
+                        )
+
+            weights_gpu = self._merge_updates(weights_gpu, numerator_gpu, denominator_gpu)
 
         # Copy back arrays to host
-        if self.xp.__name__ == 'cupy':
-            self._weights = self.xp.asnumpy(self._weights_gpu)
+        if GPU_SUPPORTED and isinstance(weights_gpu, cp.ndarray):
+            self._weights = weights_gpu.get()
         else:
-            self._weights = self._weights_gpu
-        
+            self._weights = weights_gpu
+
         # free temporary memory
         self._sq_weights_gpu = None
-        del self._numerator_gpu
-        del self._denominator_gpu
-        del self._activation_map_gpu
-        
+
+        if hasattr(self, '_activation_map_gpu'):
+            del self._activation_map_gpu
+
         if verbose:
             print('\n quantization error:', self.quantization_error(data))
+
+        return self
 
 
     def train_batch(self, data, num_iteration, verbose=False):
@@ -537,46 +615,53 @@ class XPySom:
         return self.train(data, num_iteration, verbose=verbose)
 
 
+    def predict(self, data):
+        def _predict(data, xp):
+            shape = (self._weights.shape[0], self._weights.shape[1])
+            winner_coordinates = xp.array([self.winner(x) for x in data]).T
+            return xp.asarray(xp.ravel_multi_index(winner_coordinates, shape))
+
+        if default_da and isinstance(data, da.core.Array):
+            if self.use_dask:
+                return data.map_blocks(_predict, self.xp, dtype=self.xp.float32, meta=self.xp.array((), dtype=self.xp.float32))
+        return _predict(data, self.xp)
+
+
     def quantization(self, data):
         """Assigns a code book (weights vector of the winning neuron)
         to each sample in data."""
         
         data_gpu = self.xp.array(data)
-        self._weights_gpu = self.xp.array(self._weights)
-        qnt = self._quantization(data_gpu)
+        qnt = self._quantization(data_gpu, self.xp.array(self._weights))
 
-        del self._weights_gpu
-
-        if self.xp.__name__ == 'cupy':
-            return self.xp.asnumpy(qnt)
+        if GPU_SUPPORTED and isinstance(qnt, cp.ndarray):
+            return qnt.get()
         else:
             return qnt
 
 
-    def _quantization(self, data_gpu):
+    def _quantization(self, data_gpu, weights_gpu):
         """Assigns a code book (weights vector of the winning neuron)
         to each sample in data."""
         self._check_input_len(data_gpu)
-        winners_coords = self.xp.argmin(self._distance_from_weights(data_gpu), axis=1)
-        return self._weights_gpu[self.xp.unravel_index(winners_coords,
-                                           self._weights.shape[:2])]
+        winners_coords = self.xp.argmin(self._distance_from_weights(data_gpu, weights_gpu), axis=1)
+        return weights_gpu[self.xp.unravel_index(winners_coords,
+                           self._weights.shape[:2])].copy()
 
-    def distance_from_weights(self, data):
+    def distance_from_weights(self, data, weights_gpu):
         """Returns a matrix d where d[i,j] is the euclidean distance between
         data[i] and the j-th weight.
         """
         data_gpu = self.xp.array(data)
-        self._weights_gpu = self.xp.array(self._weights)
-        d = self._distance_from_weights(data_gpu)
+        weights_gpu = self.xp.array(self._weights)
+        d = self._distance_from_weights(data_gpu, weights_gpu)
 
-        del self._weights_gpu
-
-        if self.xp.__name__ == 'cupy':
-            return self.xp.asnumpy(d)
+        if GPU_SUPPORTED and isinstance(d, cp.ndarray):
+            return d.get()
         else:
             return d
 
-    def _distance_from_weights(self, data_gpu):
+    def _distance_from_weights(self, data_gpu, weights):
         """Returns a matrix d where d[i,j] is the euclidean distance between
         data[i] and the j-th weight.
         """
@@ -585,8 +670,8 @@ class XPySom:
             end = start + self._n_parallel
             if end > len(data_gpu):
                 end = len(data_gpu)
-            
-            distances.append(euclidean_distance(data_gpu[start:end], self._weights_gpu, xp=self.xp))
+
+            distances.append(euclidean_distance(data_gpu[start:end], weights, xp=self.xp))
         return self.xp.vstack(distances)
 
     def quantization_error(self, data):
@@ -594,20 +679,34 @@ class XPySom:
         distance between each input sample and its best matching unit."""
         self._check_input_len(data)
 
-        # load to GPU
-        data_gpu = self.xp.array(data, dtype=self.xp.float32)
-        self._weights_gpu = self.xp.array(self._weights)
+        if self.use_dask:
+            if default_da and isinstance(data, da.core.Array):
+                data_gpu = data
+            else:
+                data_gpu = da.from_array(self.xp.array(data, dtype=self.xp.float32), chunks=self.dask_chunks)
 
-        # recycle buffer
-        data_gpu -= self._quantization(data_gpu) 
+            blocks = data_gpu
 
-        # free no longer needed buffer
-        del self._weights_gpu
+            def _quantization_error_block(block, weights):
+                weights_gpu = self.xp.array(weights)
 
-        qe = self.xp.linalg.norm(data_gpu, axis=1).mean()
-        
-        # free no longer needed buffer
-        del data_gpu
+                new_block = block - self._quantization(block, weights_gpu)
+
+                return new_block
+
+            q_error = blocks.map_blocks(_quantization_error_block, self._weights, dtype=self.xp.float32)
+
+            qe_lin = da.linalg.norm(q_error, axis=1)
+            qe = qe_lin.mean().compute()
+        else:
+            # load to GPU
+            data_gpu = self.xp.array(data, dtype=self.xp.float32)
+            weights_gpu = self.xp.array(self._weights)
+
+            # recycle buffer
+            data_gpu -= self._quantization(data_gpu, weights_gpu)
+
+            qe = self.xp.linalg.norm(data_gpu, axis=1).mean()
 
         return qe.item()
 
@@ -630,13 +729,10 @@ class XPySom:
 
         # load to GPU
         data_gpu = self.xp.array(data, dtype=self.xp.float32)
-        self._weights_gpu = self.xp.array(self._weights)
 
-        distances = self._distance_from_weights(data_gpu) 
+        weights_gpu = self.xp.array(self._weights)
 
-        # free no longer needed buffers
-        self._weights_gpu = None
-        del data_gpu
+        distances = self._distance_from_weights(data_gpu, weights_gpu)
 
         # b2mu: best 2 matching units
         b2mu_inds = self.xp.argsort(distances, axis=1)[:, :2]
